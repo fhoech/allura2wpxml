@@ -4,9 +4,18 @@
 """ Run this JavaScript on the user mapping page when importing:
 
 (function ($) {
+	var users = [];
+	$('select[name^="user_map"] option').each(function () {
+		users.push($(this).text().replace(/^\(|\s+SourceForge\)$/g, ''));
+	});
 	$('ol#authors li').each(function () {
-		var author = $(this).find('strong').text().match(/\(([^)]+)\)/)[1];
-		$(this).find('input[name^="user_new"]').val(author + ' (SourceForge)');
+		var author = $(this).find('strong').text().match(/\(([^)]+)\)/)[1],
+			index = users.indexOf(author);
+		if (index < 0) {
+			$(this).find('input[name^="user_new"]').val(author + ' (SourceForge)');
+			index = 0;
+		}
+		$(this).find('select[name^="user_map"]')[0].selectedIndex = index;
 	})
 })(jQuery)
 
@@ -14,12 +23,14 @@
 
 from __future__ import print_function
 from collections import OrderedDict
+import cgi
 import json
 import os
 import re
 import sys
 import time
 import unicodedata
+import urllib
 
 
 import markdown as _markdown
@@ -27,8 +38,10 @@ import markdown as _markdown
 
 _allura_id_to_wpxml_id = {}
 _id = 0
+_slugs = []
 
-revision_template = '''<ul class="bbp-reply-revision-log">
+revision_template = '''
+<ul class="bbp-reply-revision-log">
 	<li class="bbp-reply-revision-log-item">
 		This %(post_type)s was modified on %(mtime)s by %(author)s.
 	</li>
@@ -54,15 +67,28 @@ def get_post_content(post, post_type):
 
 
 def make_slug(title):
-	return re.sub(r'[\s.-]+', '-',
+	slug = re.sub(r'[\s.-]+', '-',
 				  re.sub(r'[^\w\s.-]', '',
 						 unicodedata.normalize('NFKD',
 											   title).encode('ascii',
 															 'ignore')).strip().lower()).strip('-')
+	original_slug = slug
+	num = 1
+	while slug in _slugs:
+		num += 1
+		slug = original_slug + '-%i' % num
+	if num > 1:
+		print(slug, file=sys.stderr)
+	_slugs.append(slug)
+	return slug
 
 
 def markdown(text):
-	html = _markdown.markdown(text, output_format='xhtml5')
+	html = cgi.escape(text)
+	# Restore Markdown blockquoting
+	html = re.sub(r'^&gt;', '>', html, flags=re.M)
+	# Markdown to WP HTML
+	html = _markdown.markdown(html, output_format='xhtml5')
 	html = html.replace('</p>\n<p>', '\n\n')
 	html = html.replace('<p>', '')
 	html = html.replace('</p>', '')
@@ -74,11 +100,11 @@ def markdown(text):
 class WPXML_Item(OrderedDict):
 
 	def __init__(self, parent, id, post_type, title, base_url,
-				 link='%(base_url)s?post_type=%(post_type)s&#038;p=%(id)s',
+				 link='%(base_url)s?post_type=%(post_type)s&p=%(id)s',
 				 date_time=None, creator='', guid=None, post_name=None,
 				 content='', comment_status='open', ping_status='open',
 				 menu_order=0, post_password='', is_sticky=False,
-				 status='publish'):
+				 status='publish', excerpt=''):
 		OrderedDict.__init__(self)
 		id = get_id(id)
 		self.items = []
@@ -100,14 +126,15 @@ class WPXML_Item(OrderedDict):
 			link = link % locals()
 		if not guid:
 			guid = link
-		self.update([('title', title),
-					 ('link', link),
+		content = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]+', '', content)
+		self.update([('title', cgi.escape(title)),
+					 ('link', cgi.escape(link)),
 					 ('pubDate', time.strftime('%a, %d %b %Y %H:%M:%S +0000', timestamp)),
-					 ('dc:creator', creator),
-					 ('guid', guid),
+					 ('dc:creator', cgi.escape(creator)),
+					 ('guid', cgi.escape(guid)),
 					 ('description', ''),
 					 ('content:encoded', content),
-					 ('excerpt:encoded', ''),
+					 ('excerpt:encoded', excerpt),
 					 ('wp:post_id', id),
 					 ('wp:post_date', time.strftime('%Y-%m-%d %H:%M:%S', timestamp)),
 					 ('wp:post_date_gmt', time.strftime('%Y-%m-%d %H:%M:%S', timestamp_gmt)),
@@ -118,7 +145,7 @@ class WPXML_Item(OrderedDict):
 					 ('wp:post_parent', parent.get('wp:post_id', 0)),
 					 ('wp:menu_order', menu_order),
 					 ('wp:post_type', post_type),
-					 ('wp:post_password', post_password),
+					 ('wp:post_password', cgi.escape(post_password)),
 					 ('wp:is_sticky', int(is_sticky))])
 
 	@property
@@ -191,7 +218,7 @@ class WPXML_Item(OrderedDict):
 					   'wp:post_id', 'wp:post_parent', 'wp:menu_order',
 					   'wp:is_sticky'):
 				xml += unicode(value)
-			else:
+			elif value:
 				xml += '<![CDATA[%s]]>' % value
 			xml += '</%s>\n' % key
 		for meta_key, meta_value in self.postmeta.iteritems():
@@ -207,9 +234,12 @@ class WPXML_Item(OrderedDict):
 
 class Allura2WPXML():
 
-	def __init__(self, json_filename, start_id=1, base_url='', creator=''):
+	def __init__(self, json_filename, start_id=1, base_url='', creator='',
+				 include_attachments='all',
+				 post_date_range=[(0, 0, 0), time.localtime()]):
 		global _id
 		_id = start_id
+		self.include_attachments = include_attachments
 		self.items = []
 		with open(json_filename, 'r') as json_file:
 			allura_dict = json.load(json_file)
@@ -233,17 +263,23 @@ class Allura2WPXML():
 					for thread in forum['threads']:
 						if not thread['posts']:
 							continue
+						post_timestamp = time.strptime(thread['posts'][-1]['timestamp'].split('.')[0],
+													   '%Y-%m-%d %H:%M:%S')
+						if (post_timestamp[:3] < post_date_range[0][:3] or 
+							post_timestamp[:3] > post_date_range[1][:3]):
+							continue
 						last_active = time.localtime(0)
 						last_reply_id = 0
 						last_active_id = 0
 						voices = set()
 						post1 = thread['posts'][0]
+						post_name = make_slug(thread['subject'] + '-' + thread['_id'])
 						wpxml_topic = WPXML_Item(wpxml_forum, thread['_id'],
 												 'topic', thread['subject'],
 												 base_url,
 												 '%(base_url)sforums/topic/%(post_name)s/',
 												 post1['timestamp'],
-												 post1['author'], None, None,
+												 post1['author'], None, post_name,
 												 get_post_content(post1, 'topic'),
 												 'closed')
 						self.items.append(wpxml_topic)
@@ -289,6 +325,7 @@ class Allura2WPXML():
 								forum_last_active = last_active
 								forum_last_active_id = last_active_id
 								last_topic_id = wpxml_topic['wp:post_id']
+								forum_last_reply_id = wpxml_reply['wp:post_id']
 							last_reply_id = wpxml_reply['wp:post_id']
 							reply_count += 1
 							wpxml_reply.postmeta.update([('_bbp_author_ip', '0.0.0.0'),
@@ -321,15 +358,18 @@ class Allura2WPXML():
 
 	def _add_attachments(self, post, parent):
 		for attachment in post['attachments']:
+			title = urllib.unquote(os.path.basename(attachment['url']).encode('utf8')).decode('utf8')
+			post_name = make_slug(title + '-' + post['slug'])
 			wpxml_attachment = WPXML_Item(parent,
 										  attachment['url'],
 										  'attachment',
-										  os.path.basename(attachment['url']),
+										  title,
 										  '',
 										  attachment['url'],
 										  post['timestamp'],
-										  post['author'], None, None,
+										  post['author'], None, post_name,
 										  '', 'open', 'open',
+										  excerpt=parent['wp:post_id'],
 										  status='inherit')
 			self.items.append(wpxml_attachment)
 			wpxml_attachment['wp:attachment_url'] = attachment['url']
@@ -348,20 +388,45 @@ class Allura2WPXML():
 	<wp:wxr_version>1.2</wp:wxr_version>
 '''
 		for item in self.items:
-			xml += item.xml
+			if (item['wp:post_type'] != 'attachment' and
+				self.include_attachments != 'only') or (item['wp:post_type'] == 'attachment' and
+														self.include_attachments in ('all', 'only')):
+				xml += item.xml
 		xml += '''</channel>
 </rss>
 '''
 		return xml
 
 
-def main(json_filename, start_id=1, base_url='', creator=''):
-	print(Allura2WPXML(json_filename, int(start_id), base_url, creator).xml)
+def main(json_filename, start_id=1, base_url='', creator='',
+		 include_attachments='all', post_date_range='0001-01-01_' +
+												  time.strftime('%Y-%m-%d')):
+	post_date_range = [time.strptime(date, '%Y-%m-%d')
+					   for date in post_date_range.split('_')]
+	print('Allura JSON filename:', json_filename, file=sys.stderr)
+	print('WordPress post start ID:', start_id, file=sys.stderr)
+	print('Base URL:', base_url, file=sys.stderr)
+	print('WordPress post author:', creator, file=sys.stderr)
+	print('Include attachments:', include_attachments, file=sys.stderr)
+	print('Post date range:', ' to '.join([time.strftime('%Y-%m-%d', date)
+										   for date in post_date_range]),
+		  file=sys.stderr)
+	print(Allura2WPXML(json_filename, int(start_id), base_url, creator,
+					   include_attachments, post_date_range).xml)
 
 
 if __name__ == '__main__':
 	if not sys.argv[1:]:
 		print("Usage:", os.path.basename(__file__),
-			  "json_filename start_id base_url [author_username]")
+			  "json_filename start_id base_url author_username "
+			  "[include_attachments] [post_date_range]", file=sys.stderr)
+		print('start_id              WordPress post start ID', file=sys.stderr)
+		print('base_url              WordPress base URL', file=sys.stderr)
+		print('author_username       WordPress username to use for attachments',
+		      file=sys.stderr)
+		print('include_attachments   Include attachments? (all|none|only, default all)',
+			  file=sys.stderr)
+		print('post_date_range       Posts to include from_to YYYY-mm-dd_YYYY-mm-dd',
+			  file=sys.stderr)
 	else:
 		main(*sys.argv[1:])
